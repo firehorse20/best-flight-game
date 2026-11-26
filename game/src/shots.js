@@ -1,79 +1,125 @@
-// The screenshot scenes behind ?shot=start|play|end. Each one plays the real rules forward from a
-// fresh world for a fixed number of steps, steered by a simple autopilot (look ahead each way the
-// paddle could move, keep clear of blocks, chase the lowest coin when that is safe), so the frame
-// is what a short game really looks like and the same seed always gives the same frame.
-import { FIELD, PLAYER, STEP } from './config.js';
-import { EVENT_OVER, KIND_BLOCK } from './world.js';
-import { SCREEN_OVER, SCREEN_PLAY, SCREEN_TITLE } from './render.js';
+// The screenshot scenes behind ?shot=takeoff|coast|cockpit|landing. Each one
+// plays the real rules forward from a fresh world, steered by an autopilot
+// (aim at the next ring, climb to its height, hold the throttle), so the frame
+// is what a real flight looks like and the same seed always gives the same
+// frame. The landing scene flies a whole contract to a touchdown.
+import { STEP } from './config.js';
+import { heightAt } from './terrain.js';
+import { EVENT_CRASH, EVENT_DONE } from './world.js';
+import { SCREEN_DONE, SCREEN_OVER, SCREEN_PLAY } from './render.js';
 
-const START_SECONDS = 5;
-const PLAY_SECONDS = 26;
-const END_LIMIT_SECONDS = 600;
-/**
- * How far ahead, in seconds, the autopilot checks each way it could move: the play scene's pilot
- * looks well ahead and keeps all its lives; the end scene's looks only a moment ahead, so it is
- * caught out once the blocks speed up, as a hurried player is.
- */
-const HORIZON_PLAY = 0.7;
-const HORIZON_END = 0.25;
-const SAMPLE = 1 / 30;
-const DIRECTIONS = [0, -1, 1];
-/** Extra room, each side, it keeps between the paddle and a block. */
-const MARGIN = 10;
+const TAKEOFF_SECONDS = 5;
+const COAST_SECONDS = 24;
+const LANDING_LIMIT_SECONDS = 420;
 
-/** Seconds until moving in `direction` (-1, 0, 1) runs the paddle into a block; Infinity when it never does. */
-function timeToHit(state, direction, horizon) {
-  const player = state.player;
-  for (let t = SAMPLE; t <= horizon; t += SAMPLE) {
-    const x = Math.min(FIELD.width - player.width, Math.max(0, player.x + direction * PLAYER.speed * t));
-    for (let index = 0; index < state.items.length; index += 1) {
-      const item = state.items[index];
-      if (!item.active || item.kind !== KIND_BLOCK) continue;
-      const y = item.y + item.speed * t;
-      if (y + item.height > player.y && y < player.y + player.height && item.x < x + player.width + MARGIN && item.x + item.width > x - MARGIN) return t;
+/** Steer the plane at the next ring (or the destination runway once they are done). */
+export function autopilot(state, speedTarget) {
+  const plane = state.plane;
+  const rings = state.rings;
+  let targetX;
+  let targetY;
+  let targetZ;
+  let turn;
+  let pitch;
+  if (state.ringIndex < rings.length) {
+    // En route: point pursuit of the next ring, climbing over ground ahead.
+    const ring = rings[state.ringIndex];
+    targetX = ring.x;
+    targetY = ring.y;
+    targetZ = ring.z;
+    const dx = targetX - plane.x;
+    const dz = targetZ - plane.z;
+    const desiredHeading = Math.atan2(dx, dz);
+    let error = desiredHeading - plane.heading;
+    while (error > Math.PI) error -= Math.PI * 2;
+    while (error < -Math.PI) error += Math.PI * 2;
+    turn = Math.max(-1, Math.min(1, error * 2.2));
+    // Climb over the ground ahead as well as toward the ring: islands between
+    // two rings are higher than the rings themselves. Sample the whole
+    // approach, not one point ahead: a single sample past a peak would read
+    // low ground and dive the plane into the near slope.
+    let maxGround = 0;
+    for (let distance = 60; distance <= 300; distance += 60) {
+      const aheadX = plane.x + Math.sin(plane.heading) * distance;
+      const aheadZ = plane.z + Math.cos(plane.heading) * distance;
+      maxGround = Math.max(maxGround, heightAt(aheadX, aheadZ));
     }
+    const desiredAlt = Math.max(targetY, maxGround + 18);
+    pitch = Math.max(-1, Math.min(1, (desiredAlt - plane.y) / 45));
+  } else {
+    // Final approach: fly at the threshold itself, slow, on a shallow slope
+    // whose foot sits below ground level so the plane is driven onto the
+    // strip. The landing zone is the whole island top, so an orbit that
+    // settles onto the grass still counts as landing at the destination.
+    const dest = state.destination;
+    targetX = dest.x;
+    targetZ = dest.z - 60;
+    targetY = heightAt(dest.x, dest.z) - 4 + Math.max(0, (dest.z - 60 - plane.z)) * 0.1;
+    const dx = targetX - plane.x;
+    const dz = targetZ - plane.z;
+    const desiredHeading = Math.atan2(dx, dz);
+    let error = desiredHeading - plane.heading;
+    while (error > Math.PI) error -= Math.PI * 2;
+    while (error < -Math.PI) error += Math.PI * 2;
+    turn = Math.max(-1, Math.min(1, error * 2.2));
+    pitch = Math.max(-1, Math.min(1, (targetY - plane.y) / 25));
   }
-  return Infinity;
+  const dz = targetZ - plane.z;
+  // On final approach, slow down for the runway.
+  const close = Math.abs(dz) < 400 && state.ringIndex >= rings.length;
+  const speed = close ? 0.35 : speedTarget;
+  const throttle = Math.max(-1, Math.min(1, (speed - plane.throttleTarget) * 6));
+  return { pitch, turn, throttle };
 }
 
-/** Of the safe ways to move, the one toward the lowest coin (or the centre); else the one that is hit last. */
-function autopilot(state, horizon) {
-  const player = state.player;
-  let coin = null;
-  for (let index = 0; index < state.items.length; index += 1) {
-    const item = state.items[index];
-    if (item.active && item.kind !== KIND_BLOCK && (coin === null || item.y > coin.y)) coin = item;
-  }
-  const target = coin === null ? FIELD.width / 2 : coin.x + coin.width / 2;
-  const centre = player.x + player.width / 2;
-  const wanted = target > centre + 8 ? 1 : target < centre - 8 ? -1 : 0;
-  let best = wanted;
-  let bestTime = timeToHit(state, wanted, horizon);
-  for (let index = 0; index < DIRECTIONS.length && bestTime !== Infinity; index += 1) {
-    const time = timeToHit(state, DIRECTIONS[index], horizon);
-    if (time > bestTime) {
-      bestTime = time;
-      best = DIRECTIONS[index];
-    }
-  }
-  return best;
+/** The title screen's backdrop: the same pilot, gentle and harmless. */
+export function titlePilot(state) {
+  return autopilot(state, 0.55);
 }
 
 /**
- * Set `world` to the named scene (start, play or end; any other name is start) and return the
- * screen to draw over it and the best score to show.
+ * Set `world` to the named scene and return the screen to draw over it and the
+ * best credits to show. Names: takeoff, coast, cockpit, landing; any other name
+ * is the title backdrop.
  */
 export function stageShot(name, world) {
+  const state = world.state;
+  if (name === 'takeoff') {
+    world.startMission(0);
+    for (let index = 0; index < TAKEOFF_SECONDS / STEP; index += 1) {
+      world.step(STEP, autopilot(state, 0.9), true);
+    }
+    return { screen: SCREEN_PLAY, best: 0 };
+  }
+  if (name === 'coast') {
+    world.startMission(0);
+    for (let index = 0; index < COAST_SECONDS / STEP; index += 1) {
+      world.step(STEP, autopilot(state, 0.75), true);
+    }
+    return { screen: SCREEN_PLAY, best: state.credits };
+  }
+  if (name === 'cockpit') {
+    world.startMission(1);
+    state.view = 'cockpit';
+    for (let index = 0; index < COAST_SECONDS / STEP; index += 1) {
+      world.step(STEP, autopilot(state, 0.75), true);
+    }
+    return { screen: SCREEN_PLAY, best: state.credits };
+  }
+  if (name === 'landing') {
+    world.startMission(1);
+    let done = false;
+    for (let index = 0; index < LANDING_LIMIT_SECONDS / STEP; index += 1) {
+      const events = world.step(STEP, autopilot(state, 0.75), true);
+      if (events & (EVENT_DONE | EVENT_CRASH)) {
+        done = true;
+        break;
+      }
+    }
+    const over = state.phase === 'over';
+    return { screen: over ? SCREEN_OVER : SCREEN_DONE, best: state.credits, done };
+  }
   world.reset();
-  if (name !== 'play' && name !== 'end') {
-    for (let index = 0; index < START_SECONDS / STEP; index += 1) world.step(STEP, 0, true);
-    return { screen: SCREEN_TITLE, best: 0 };
-  }
-  const limit = name === 'end' ? END_LIMIT_SECONDS : PLAY_SECONDS;
-  const horizon = name === 'end' ? HORIZON_END : HORIZON_PLAY;
-  for (let index = 0; index < limit / STEP; index += 1) {
-    if (world.step(STEP, autopilot(world.state, horizon), false) & EVENT_OVER) break;
-  }
-  const over = world.state.lives === 0;
-  return { screen: over ? SCREEN_OVER : SCREEN_PLAY, best: world.state.score };
+  state.phase = 'title';
+  return { screen: 'title', best: 0 };
 }
